@@ -1,0 +1,92 @@
+pipeline {
+  agent any
+
+  environment {
+    GIT_URL                = 'https://github.com/cchloe1006-eng/myfirst-api-server-skala.git'
+    GIT_BRANCH             = 'main'
+    GIT_ID                 = 'skala-github-id'
+    IMAGE_NAME             = 'sk169-webserver'
+    IMAGE_TAG              = '1.0'
+    IMAGE_REGISTRY_URL     = 'skala-registry.skala-ai.com'
+    IMAGE_REGISTRY_PROJECT = 'class-5'
+    DOCKER_CREDENTIAL_ID   = 'skala-image-registry-id'
+    K8S_NAMESPACE          = 'class-5'
+    DEPLOYMENT_NAME        = 'sk169-myfirst-api-server'
+  }
+
+  options {
+    disableConcurrentBuilds()
+    timestamps()
+  }
+
+  stages {
+    stage('Clone Repository') {
+      steps {
+        git branch: "${GIT_BRANCH}", url: "${GIT_URL}", credentialsId: "${GIT_ID}"
+      }
+    }
+
+    stage('Build with Maven') {
+      steps {
+        sh 'mvn clean package -DskipTests'
+      }
+    }
+
+    stage('Image Build & Push') {
+      steps {
+        withCredentials([usernamePassword(
+          credentialsId: "${DOCKER_CREDENTIAL_ID}",
+          usernameVariable: 'REG_USER',
+          passwordVariable: 'REG_PASS'
+        )]) {
+          sh '''
+            set -eu
+            FINAL_IMAGE_TAG="${IMAGE_TAG}-${BUILD_NUMBER}"
+            IMAGE_REF="${IMAGE_REGISTRY_URL}/${IMAGE_REGISTRY_PROJECT}/${IMAGE_NAME}:${FINAL_IMAGE_TAG}"
+
+            echo "$REG_PASS" | docker login "$IMAGE_REGISTRY_URL" \
+              -u "$REG_USER" --password-stdin
+            docker buildx build --platform linux/amd64 \
+              -t "$IMAGE_REF" --push .
+            docker logout "$IMAGE_REGISTRY_URL" || true
+          '''
+        }
+      }
+    }
+
+    stage('Update K8s Manifests') {
+      steps {
+        sh '''
+          set -eu
+          FINAL_IMAGE_TAG="${IMAGE_TAG}-${BUILD_NUMBER}"
+          IMAGE_BASE="${IMAGE_REGISTRY_URL}/${IMAGE_REGISTRY_PROJECT}/${IMAGE_NAME}"
+
+          cd kustomize/overlays/dev
+          kustomize edit set image \
+            "${IMAGE_BASE}=${IMAGE_BASE}:${FINAL_IMAGE_TAG}"
+          cat kustomization.yaml
+        '''
+      }
+    }
+
+    stage('Deploy to Kubernetes') {
+      steps {
+        sh '''
+          set -eu
+          kustomize build kustomize/overlays/dev | \
+            kubectl apply -n "$K8S_NAMESPACE" -f -
+          kubectl rollout status "deployment/$DEPLOYMENT_NAME" \
+            -n "$K8S_NAMESPACE" --timeout=180s
+          kubectl get pods -n "$K8S_NAMESPACE" \
+            -l "app=$DEPLOYMENT_NAME"
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      deleteDir()
+    }
+  }
+}
